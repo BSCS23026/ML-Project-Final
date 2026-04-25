@@ -1,0 +1,11 @@
+{
+  "image_size": 128,
+  "num_classes": 10,
+  "epochs": 30,
+  "patience": 6,
+  "lr": 0.0005,
+  "batch_size": 32,
+  "model_path": "model.pth",
+  "labels_path": "labels.json",
+  "config_path": "config.json"
+}

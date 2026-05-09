@@ -68,6 +68,14 @@ CONFIG = {
     "model_path":      "model_v4.pth",
     "labels_path":     "labels.json",
     "config_path":     "config.json",
+
+    # LR to inject when resuming.
+    # OneCycleLR cannot be resumed mid-cycle (it's stateful and expects a
+    # fixed total step count). When we resume, we swap to ReduceLROnPlateau
+    # and start from this LR — roughly the mid-decay point of the original
+    # cycle (≈ 0.3 × max_lr). High enough to keep learning, low enough not
+    # to destabilise already-trained weights.
+    "resume_lr":       1.5e-4,
 }
 
 
@@ -484,6 +492,8 @@ print(f"Total trainable parameters: {total_params:,}")
 def train_epoch(model, loader, optimizer, scheduler, desc=""):
     """
     Training pass with MixUp.
+    scheduler: pass the OneCycleLR instance for fresh training (stepped per batch),
+               or None when using ReduceLROnPlateau on resume (stepped per epoch).
     Returns: avg_loss only — acc/F1 are not reported (MixUp makes them invalid).
     """
     model.train()
@@ -501,8 +511,12 @@ def train_epoch(model, loader, optimizer, scheduler, desc=""):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        # OneCycleLR must be stepped every batch.
+        # ReduceLROnPlateau is stepped per epoch (done in the training loop),
+        # so we only step here when scheduler is OneCycleLR.
         if scheduler is not None:
-            scheduler.step()   # per-batch — required for OneCycleLR
+            scheduler.step()
 
         total_loss += loss.item()
         loop.set_postfix(loss=f"{loss.item():.3f}")
@@ -544,7 +558,7 @@ def eval_epoch(model, loader, desc=""):
 
 
 # =========================
-# TRAINING
+# TRAINING (fresh run — uses OneCycleLR stepped per batch)
 # =========================
 def train_model(model, epochs=CONFIG["epochs"], patience=CONFIG["patience"]):
     best_val_f1      = 0.0
@@ -557,7 +571,7 @@ def train_model(model, epochs=CONFIG["epochs"], patience=CONFIG["patience"]):
         train_loss = train_epoch(
             model, train_loader,
             optimizer=optimizer,
-            scheduler=scheduler,
+            scheduler=scheduler,   # OneCycleLR — stepped per batch inside train_epoch
             desc=f"Epoch [{ep}/{epochs}] Train"
         )
         # Val: no MixUp → acc + F1 are valid
@@ -568,6 +582,67 @@ def train_model(model, epochs=CONFIG["epochs"], patience=CONFIG["patience"]):
 
         current_lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {ep}/{epochs}  |  LR: {current_lr:.2e}")
+        print(f"  Train → Loss: {train_loss:.4f}  (acc/F1 not shown — MixUp active)")
+        print(f"  Val   → Loss: {val_loss:.4f} | Acc: {val_acc:.2f}% | F1: {val_f1:.4f}")
+
+        if val_f1 > best_val_f1:
+            best_val_f1      = val_f1
+            patience_counter = 0
+            torch.save(model.state_dict(), CONFIG["model_path"])
+            print(f"  ✅ Best model saved (Val Macro F1: {best_val_f1:.4f})")
+        else:
+            patience_counter += 1
+            print(f"  ⏳ No improvement ({patience_counter}/{patience})")
+
+        if patience_counter >= patience:
+            print("\n🛑 Early stopping triggered.")
+            break
+
+    print(f"\nTraining complete. Best Val Macro F1: {best_val_f1:.4f}")
+
+
+# =========================
+# TRAINING WITH PLATEAU SCHEDULER (used on resume)
+#
+# Identical logic to train_model but:
+#   - initial_best_f1 accepted so we start from the checkpoint's real F1,
+#     not 0.0 — prevents epoch 1 from always saving a potentially worse model
+#   - passes scheduler=None to train_epoch (no per-batch stepping)
+#   - steps ReduceLROnPlateau on val_f1 once per epoch
+#   - prints whether the plateau scheduler reduced the LR this epoch
+# =========================
+def train_model_with_plateau(model, plateau_scheduler,
+                              epochs=CONFIG["epochs"], patience=CONFIG["patience"],
+                              initial_best_f1: float = 0.0):  # ← ADDED: real floor from resume_training
+    best_val_f1      = initial_best_f1  # ← CHANGED: was hardcoded 0.0
+    patience_counter = 0
+
+    print(f"  Baseline F1 to beat: {best_val_f1:.4f}\n")
+
+    for epoch in range(epochs):
+        ep = epoch + 1
+
+        train_loss = train_epoch(
+            model, train_loader,
+            optimizer=optimizer,
+            scheduler=None,        # ← ReduceLROnPlateau is NOT per-batch
+            desc=f"Epoch [{ep}/{epochs}] Train"
+        )
+        val_acc, val_loss, val_f1 = eval_epoch(
+            model, val_loader,
+            desc=f"Epoch [{ep}/{epochs}] Val"
+        )
+
+        # Step the plateau scheduler on val F1 (maximising).
+        # This halves the LR only when F1 stalls for `patience` epochs
+        # (scheduler's own patience=5, separate from early-stop patience=20).
+        prev_lr = optimizer.param_groups[0]['lr']
+        plateau_scheduler.step(val_f1)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        lr_tag = f"  📉 LR reduced: {prev_lr:.2e} → {current_lr:.2e}" if current_lr < prev_lr else ""
+
+        print(f"\nEpoch {ep}/{epochs}  |  LR: {current_lr:.2e}{lr_tag}")
         print(f"  Train → Loss: {train_loss:.4f}  (acc/F1 not shown — MixUp active)")
         print(f"  Val   → Loss: {val_loss:.4f} | Acc: {val_acc:.2f}% | F1: {val_f1:.4f}")
 
@@ -680,7 +755,32 @@ def resume_training(model, resume_path: str = CONFIG["model_path"]):
 
     print(f"Loading weights from '{resume_path}' and resuming training...")
     model.load_state_dict(torch.load(resume_path, map_location=device))
-    train_model(model)
+
+    # ── ADDED: baseline val pass ──────────────────────────────────────────
+    # Measure the checkpoint's actual F1 on the val set before any training.
+    # This becomes the floor passed to train_model_with_plateau so the loop
+    # only saves when it genuinely beats the loaded checkpoint — not just 0.0.
+    print("\nRunning baseline validation on loaded checkpoint...")
+    _, _, baseline_f1 = eval_epoch(model, val_loader, desc="Baseline Val")
+    print(f"Checkpoint baseline Val F1: {baseline_f1:.4f} — must beat this to save.\n")
+    # ─────────────────────────────────────────────────────────────────────
+
+    for pg in optimizer.param_groups:
+        pg['lr'] = CONFIG["resume_lr"]
+
+    # ReduceLROnPlateau: halves LR when val F1 doesn't improve for 5 epochs.
+    # mode='max' because we're maximising macro F1 (not minimising loss).
+    # min_lr=1e-6 prevents the LR from shrinking to zero and stalling training.
+    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+    )
+
+    print(f"Resumed with ReduceLROnPlateau | starting LR: {CONFIG['resume_lr']:.2e}")
+    train_model_with_plateau(model, plateau_scheduler, initial_best_f1=baseline_f1)  # ← ADDED: pass baseline
 
 
 # =========================
